@@ -63,21 +63,21 @@ STATIONS: dict[City, StationConfig] = {
     City.CHICAGO: StationConfig(
         city=City.CHICAGO,
         icao="KMDW",  # Midway Airport
-        kalshi_series="KXHIGHCHI",  # TODO: verify exact series ticker
+        kalshi_series="KXHIGHCHI",
         timezone=_tz("US/Central", -6),
         description="Midway Airport, Chicago",
     ),
     City.MIAMI: StationConfig(
         city=City.MIAMI,
         icao="KMIA",  # Miami International Airport
-        kalshi_series="KXHIGHMI",  # TODO: verify exact series ticker
+        kalshi_series="KXHIGHMIA",
         timezone=_tz("US/Eastern", -5),
         description="Miami International Airport",
     ),
     City.AUSTIN: StationConfig(
         city=City.AUSTIN,
         icao="KAUS",  # Austin-Bergstrom International Airport
-        kalshi_series="KXHIGHAU",  # TODO: verify exact series ticker
+        kalshi_series="KXHIGHAUS",
         timezone=_tz("US/Central", -6),
         description="Austin-Bergstrom International Airport",
     ),
