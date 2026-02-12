@@ -143,9 +143,104 @@ python validate.py
 - Bracket parsing from market titles is fallback logic and may need hardening against API format changes.
 - Python's `round()` behavior (banker's rounding) may differ from official NWS settlement rounding in tie cases.
 
+## Viewing Paper Trading Results
+
+The bot stores all decisions in SQLite. You have multiple ways to view results:
+
+### 1. Command-line viewer (Quick)
+
+```powershell
+# View all-time summary
+python view_results.py
+
+# View today's results only
+python view_results.py --today
+
+# View last 7 days
+python view_results.py --week
+
+# Show detailed trade history
+python view_results.py --detailed
+```
+
+### 2. Web Dashboard (Visual)
+
+Start the web server:
+```powershell
+python web_dashboard.py
+```
+
+Then open [http://localhost:5000](http://localhost:5000) in your browser.
+
+The dashboard shows:
+- Overall performance metrics
+- Total investment and potential profit
+- Per-city breakdown
+- Recent trades with full details
+- Auto-refreshes every 60 seconds
+
+### 3. Direct SQL queries
+
+```powershell
+sqlite3 data/weather_bot.db
+```
+
+```sql
+-- See all trades
+SELECT * FROM paper_trades ORDER BY trade_time DESC LIMIT 10;
+
+-- Summary by city
+SELECT city, COUNT(*) as trades,
+       SUM(potential_profit_cents)/100.0 as potential_profit
+FROM paper_trades
+WHERE action = 'BUY_YES'
+GROUP BY city;
+```
+
+## Running for Extended Periods
+
+### Run for a week
+
+```powershell
+# Windows PowerShell
+.\run_bot_week.ps1
+```
+
+Or manually:
+```powershell
+python main.py
+```
+
+The bot will:
+- Run continuously until stopped (Ctrl+C)
+- Poll METAR data every 60 seconds (configurable in `config/settings.py`)
+- Log all activity to console
+- Store every observation and decision in `data/weather_bot.db`
+- Automatically handle day transitions
+
+### As a background service (Advanced)
+
+For longer runs, consider using a process manager:
+
+**Windows (NSSM)**:
+```powershell
+# Download NSSM, then:
+nssm install KalshiWeatherBot "C:\path\to\.venv\Scripts\python.exe" "C:\path\to\main.py"
+nssm start KalshiWeatherBot
+```
+
+**Linux/Mac (systemd or tmux)**:
+```bash
+# Using tmux
+tmux new -s weather-bot
+python main.py
+# Detach with Ctrl+B, D
+```
+
 ## Suggested Next Steps
 
 - Validate all Kalshi series tickers and station mappings against live markets.
 - Implement exact NWS-compatible rounding and day-boundary logic.
 - Add integration tests with recorded Kalshi/METAR API payloads.
 - Introduce risk controls and execution module before any live trading path.
+- Analyze week-long paper trading results to validate edge hypothesis.

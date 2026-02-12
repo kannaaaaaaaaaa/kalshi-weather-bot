@@ -62,7 +62,22 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     position_size INTEGER,              -- Number of contracts
     entry_cost_cents INTEGER,           -- position_size * yes_price
     potential_profit_cents INTEGER,     -- position_size * (100 - yes_price)
+    cash_before_cents INTEGER,          -- Portfolio cash before trade
+    cash_after_cents INTEGER,           -- Portfolio cash after trade
     FOREIGN KEY (crossing_id) REFERENCES bracket_crossings(id)
+);
+
+CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_time TEXT NOT NULL,
+    cash_cents INTEGER NOT NULL,
+    positions_value_cents INTEGER NOT NULL,
+    total_capital_cents INTEGER NOT NULL,
+    realized_pnl_cents INTEGER NOT NULL,
+    total_trades INTEGER NOT NULL,
+    winning_trades INTEGER NOT NULL,
+    losing_trades INTEGER NOT NULL,
+    open_positions INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_obs_station_time
@@ -70,6 +85,9 @@ CREATE INDEX IF NOT EXISTS idx_obs_station_time
 
 CREATE INDEX IF NOT EXISTS idx_crossings_city_time
     ON bracket_crossings(city, signal_time);
+
+CREATE INDEX IF NOT EXISTS idx_portfolio_time
+    ON portfolio_snapshots(snapshot_time);
 """
 
 
@@ -157,6 +175,8 @@ class Database:
         market_no_price_cents: Optional[int] = None,
         market_volume: Optional[int] = None,
         position_size: int = 0,
+        cash_before_cents: Optional[int] = None,
+        cash_after_cents: Optional[int] = None,
     ) -> int:
         """Store a paper trade (or skip decision). Returns the row ID."""
         entry_cost = (
@@ -175,8 +195,9 @@ class Database:
                (crossing_id, trade_time, city, bracket_index, bracket_label,
                 action, skip_reason,
                 market_yes_price_cents, market_no_price_cents, market_volume,
-                position_size, entry_cost_cents, potential_profit_cents)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                position_size, entry_cost_cents, potential_profit_cents,
+                cash_before_cents, cash_after_cents)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 crossing_id,
                 datetime.now(timezone.utc).isoformat(),
@@ -191,6 +212,8 @@ class Database:
                 position_size,
                 entry_cost,
                 potential_profit,
+                cash_before_cents,
+                cash_after_cents,
             ),
         )
         self.conn.commit()

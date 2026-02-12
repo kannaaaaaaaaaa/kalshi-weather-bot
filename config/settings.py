@@ -125,6 +125,9 @@ class KalshiConfig:
 class TradingConfig:
     """Paper trading parameters."""
 
+    # Starting capital for paper trading (in dollars)
+    starting_capital_dollars: float = 100.0
+
     # Only generate BUY signal if the YES price for the crossed-into bracket
     # is below this threshold (in cents). e.g., 90 means buy if < $0.90.
     max_buy_price_cents: int = 90
@@ -133,8 +136,19 @@ class TradingConfig:
     # "high" = temp clearly in one bracket; "low" = rounding ambiguity.
     require_high_confidence: bool = True
 
-    # Simulated position size per trade (number of contracts)
+    # Position sizing strategy
+    # - 'fixed': Use default_position_size contracts per trade
+    # - 'risk_pct': Calculate based on risk_percent_per_trade
+    position_sizing_mode: str = 'risk_pct'
+
+    # Simulated position size per trade (number of contracts) - used if mode='fixed'
     default_position_size: int = 10
+
+    # Maximum % of portfolio to risk per trade (used if mode='risk_pct')
+    risk_percent_per_trade: float = 2.0
+
+    # Maximum contracts per trade (hard limit)
+    max_contracts_per_trade: int = 20
 
 
 # --- Database ---

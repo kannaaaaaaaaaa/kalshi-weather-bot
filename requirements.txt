@@ -6,6 +6,9 @@ python-dateutil>=2.9   # Timezone handling
 pytest>=8.0
 pytest-asyncio>=0.23
 
+# Dashboard
+flask>=3.0          # Web dashboard for viewing results
+
 # Future (not needed yet)
 # aiosqlite>=0.20     # Async SQLite if we need it
 # rich>=13.0          # Pretty terminal output
