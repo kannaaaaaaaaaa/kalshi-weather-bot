@@ -133,11 +133,16 @@ class KalshiClient:
             return None
 
         market = data.get("market", {})
+        # Kalshi uses yes_ask/no_ask for buy prices (what we'd pay)
+        # Use last_price as fallback, then mid-price
+        yes_price = market.get("yes_ask") or market.get("last_price") or 0
+        no_price = market.get("no_ask") or (100 - yes_price) if yes_price > 0 else 0
+
         return MarketPrice(
             ticker=market.get("ticker", ticker),
             title=market.get("title", ""),
-            yes_price_cents=market.get("yes_price", 0),
-            no_price_cents=market.get("no_price", 0),
+            yes_price_cents=yes_price,
+            no_price_cents=no_price,
             volume=market.get("volume", 0),
             open_interest=market.get("open_interest", 0),
         )
@@ -160,11 +165,15 @@ class KalshiClient:
         prices = {}
         for market in data.get("markets", []):
             ticker = market.get("ticker", "")
+            # Kalshi uses yes_ask/no_ask for buy prices (what we'd pay)
+            yes_price = market.get("yes_ask") or market.get("last_price") or 0
+            no_price = market.get("no_ask") or (100 - yes_price) if yes_price > 0 else 0
+
             prices[ticker] = MarketPrice(
                 ticker=ticker,
                 title=market.get("title", ""),
-                yes_price_cents=market.get("yes_price", 0),
-                no_price_cents=market.get("no_price", 0),
+                yes_price_cents=yes_price,
+                no_price_cents=no_price,
                 volume=market.get("volume", 0),
                 open_interest=market.get("open_interest", 0),
             )

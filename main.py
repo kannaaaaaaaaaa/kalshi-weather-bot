@@ -35,6 +35,9 @@ from engine.bracket_tracker import (
     BracketSet,
     Confidence,
 )
+from engine.portfolio import Portfolio
+from engine.trading_strategy import TradingStrategy
+from engine.position_manager import PositionManager
 from exchange.kalshi_client import KalshiClient
 from storage.db import Database
 
@@ -56,10 +59,21 @@ class WeatherBot:
         self.kalshi = KalshiClient()
         self.tracker = BracketTracker()
         self.db = Database(db_path)
+        self.portfolio = Portfolio.create(
+            starting_capital_dollars=TRADING.starting_capital_dollars
+        )
+        self.strategy = TradingStrategy()
+        self.position_manager = PositionManager(
+            portfolio=self.portfolio,
+            db=self.db,
+            kalshi=self.kalshi,
+            strategy=self.strategy,
+        )
 
         self._running = False
         self._current_date: dict[str, date] = {}  # per-city current date
         self._cycle_count = 0
+        self._trading_cycle_count = 0
         self._total_crossings = 0
         self._total_trades = 0
 
@@ -69,36 +83,48 @@ class WeatherBot:
         self._running = True
 
         logger.info("=" * 60)
-        logger.info("Kalshi Weather Bot starting")
+        logger.info("Kalshi Weather Bot starting (Two-Sided Trading Mode)")
         logger.info("Stations: %s", [s.icao for s in STATIONS.values()])
-        logger.info("Poll interval: %ds", AVIATION_WEATHER.poll_interval_seconds)
+        logger.info("METAR poll: %ds | Trading eval: %ds",
+                   AVIATION_WEATHER.poll_interval_seconds,
+                   TRADING.evaluation_interval_seconds)
+        logger.info("Starting capital: $%.2f", TRADING.starting_capital_dollars)
         logger.info("=" * 60)
 
         # Load initial brackets
         await self._load_brackets_for_all()
 
+        # Restore open positions from previous run
+        self.position_manager.load_portfolio_from_db()
+
         if once:
-            await self._run_cycle()
+            # Single cycle mode - run both once
+            await self._run_metar_cycle()
+            await self._run_trading_cycle()
         else:
-            await self._run_loop()
+            # Normal mode - run both loops concurrently
+            await asyncio.gather(
+                self._metar_loop(),
+                self._trading_loop(),
+            )
 
         await self._shutdown()
 
-    async def _run_loop(self) -> None:
-        """Main polling loop."""
+    async def _metar_loop(self) -> None:
+        """METAR polling loop - fetches temperature data."""
         while self._running:
             try:
-                await self._run_cycle()
+                await self._run_metar_cycle()
             except Exception:
-                logger.exception("Error in polling cycle")
+                logger.exception("Error in METAR polling cycle")
 
             if self._running:
                 await asyncio.sleep(AVIATION_WEATHER.poll_interval_seconds)
 
-    async def _run_cycle(self) -> None:
-        """Execute one poll-detect-evaluate cycle."""
+    async def _run_metar_cycle(self) -> None:
+        """Execute one METAR poll-and-update cycle."""
         self._cycle_count += 1
-        logger.debug("--- Cycle %d ---", self._cycle_count)
+        logger.debug("--- METAR Cycle %d ---", self._cycle_count)
 
         # 1. Fetch METAR data
         readings = await self.metar.fetch_latest()
@@ -113,102 +139,152 @@ class WeatherBot:
         # 3. Check for day transitions
         self._check_day_transitions(readings)
 
-        # 4. Process through bracket tracker
+        # 4. Process through bracket tracker (for state tracking)
         crossings = self.tracker.process_readings(readings)
 
-        # 5. For each crossing, evaluate and log
+        # 5. Log crossings (but don't trade on them directly anymore)
         for crossing in crossings:
             self._total_crossings += 1
-            await self._handle_crossing(crossing)
+            self.db.record_crossing(crossing)
+            logger.info(
+                "Bracket crossing detected: %s %s → %s",
+                crossing.city,
+                crossing.old_bracket.label if crossing.old_bracket else "None",
+                crossing.new_bracket.label,
+            )
 
         # 6. Status output
         if self._cycle_count % 10 == 0:
-            self._print_status()
+            self._print_metar_status()
 
-    async def _handle_crossing(self, crossing: BracketCrossing) -> None:
-        """Evaluate a bracket crossing and log the paper trade decision."""
-        crossing_id = self.db.record_crossing(crossing)
+    async def _trading_loop(self) -> None:
+        """Trading evaluation loop - evaluates all markets and manages positions."""
+        while self._running:
+            try:
+                await self._run_trading_cycle()
+            except Exception:
+                logger.exception("Error in trading cycle")
 
-        # Skip low-confidence crossings if configured to do so
-        if TRADING.require_high_confidence and crossing.confidence == Confidence.LOW:
-            self.db.record_paper_trade(
-                crossing_id=crossing_id,
-                crossing=crossing,
-                action="SKIP",
-                skip_reason="low_confidence_rounding_ambiguity",
-            )
-            logger.info(
-                "SKIP %s — low confidence (rounding ambiguity)",
-                crossing.city,
-            )
+            if self._running:
+                await asyncio.sleep(TRADING.evaluation_interval_seconds)
+
+    async def _run_trading_cycle(self) -> None:
+        """Execute one trading evaluation cycle."""
+        self._trading_cycle_count += 1
+        logger.debug("--- Trading Cycle %d ---", self._trading_cycle_count)
+
+        # 1. Get current temperature state
+        state = self.tracker.get_status()
+
+        # 2. For each city, evaluate all brackets
+        for city, config in STATIONS.items():
+            if not TRADING.enable_two_sided_trading:
+                continue
+
+            await self._evaluate_city_opportunities(city, config, state)
+
+        # 3. Check existing positions for exits
+        if TRADING.enable_active_exits:
+            await self._manage_open_positions()
+
+        # 4. Snapshot portfolio periodically
+        if self._trading_cycle_count % 10 == 0:
+            self.db.record_portfolio_snapshot(self.portfolio)
+            self._print_trading_status()
+
+    async def _evaluate_city_opportunities(
+        self,
+        city: City,
+        config,
+        state: dict,
+    ) -> None:
+        """Evaluate all brackets for a city and execute trades."""
+        city_state = state.get(config.icao)
+        if not city_state:
             return
 
-        # Skip first readings (no old bracket to compare against)
-        if crossing.is_first_reading:
-            self.db.record_paper_trade(
-                crossing_id=crossing_id,
-                crossing=crossing,
-                action="SKIP",
-                skip_reason="first_reading_of_day",
-            )
+        daily_max_f = city_state.get("daily_max_f")
+        if daily_max_f is None:
+            # No temperature data yet
             return
 
-        # Fetch current market price for the new bracket
-        price = await self.kalshi.fetch_market_price(crossing.new_bracket.ticker)
-        if price is None:
-            self.db.record_paper_trade(
-                crossing_id=crossing_id,
-                crossing=crossing,
-                action="SKIP",
-                skip_reason="market_price_unavailable",
-            )
-            logger.warning(
-                "SKIP %s — could not fetch market price for %s",
-                crossing.city,
-                crossing.new_bracket.ticker,
-            )
+        current_bracket_label = city_state.get("current_bracket")
+        if not current_bracket_label:
             return
 
-        # Decision: buy YES if price is below threshold
-        if price.yes_price_cents < TRADING.max_buy_price_cents:
-            self.db.record_paper_trade(
-                crossing_id=crossing_id,
-                crossing=crossing,
-                action="BUY_YES",
-                market_yes_price_cents=price.yes_price_cents,
-                market_no_price_cents=price.no_price_cents,
-                market_volume=price.volume,
-                position_size=TRADING.default_position_size,
+        # Fetch all bracket prices for this city
+        prices = await self.kalshi.fetch_prices_for_series(config.kalshi_series)
+        if not prices:
+            logger.debug("No prices available for %s", config.kalshi_series)
+            return
+
+        # Get local time for this city
+        from datetime import datetime
+        local_time = datetime.now(config.lst_tz)
+
+        # Get bracket set for this city
+        tracker = self.tracker._trackers.get(config.icao)
+        if not tracker or not tracker.bracket_set:
+            return
+
+        current_bracket = tracker.current_bracket
+        if not current_bracket:
+            return
+
+        # Evaluate each bracket
+        for bracket in tracker.bracket_set.brackets:
+            # Get price for this bracket
+            price = prices.get(bracket.ticker)
+            if not price:
+                continue
+
+            # Calculate distance
+            distance = bracket.lower_f - daily_max_f if bracket.lower_f else 0
+
+            # Evaluate opportunity
+            signal = self.strategy.evaluate_bracket_opportunity(
+                bracket=bracket,
+                current_temp_f=daily_max_f,
+                daily_max_f=daily_max_f,
+                current_bracket_index=current_bracket.index,
+                local_time=local_time,
+                market_price=price,
+                portfolio=self.portfolio,
             )
-            self._total_trades += 1
-            potential_profit = TRADING.default_position_size * (
-                100 - price.yes_price_cents
+
+            # Log evaluation
+            self.db.record_trade_evaluation(
+                city=city.value,
+                ticker=bracket.ticker,
+                bracket_label=bracket.label,
+                current_temp_f=daily_max_f,
+                bracket_distance_f=distance,
+                time_of_day_local=local_time.strftime("%H:%M"),
+                yes_price_cents=price.yes_price_cents,
+                no_price_cents=price.no_price_cents,
+                action=signal.action,
+                skip_reason=signal.skip_reason,
             )
-            logger.info(
-                "PAPER TRADE: BUY YES %s %s @ %d¢ — potential profit %d¢ "
-                "(latency: %.1fs)",
-                crossing.city,
-                crossing.new_bracket.label,
-                price.yes_price_cents,
-                potential_profit,
-                crossing.latency_seconds,
+
+            # Execute if signal says to trade
+            if signal.action in ("BUY_YES", "BUY_NO"):
+                position_id = await self.position_manager.open_position(signal)
+                if position_id:
+                    self._total_trades += 1
+
+    async def _manage_open_positions(self) -> None:
+        """Check all open positions for exit conditions."""
+        exits = await self.position_manager.check_position_exits()
+
+        for position_id, reason, exit_price in exits:
+            await self.position_manager.close_position(
+                position_id=position_id,
+                exit_price_cents=exit_price,
+                exit_reason=reason,
             )
-        else:
-            self.db.record_paper_trade(
-                crossing_id=crossing_id,
-                crossing=crossing,
-                action="SKIP",
-                skip_reason=f"price_too_high_{price.yes_price_cents}c",
-                market_yes_price_cents=price.yes_price_cents,
-                market_no_price_cents=price.no_price_cents,
-                market_volume=price.volume,
-            )
-            logger.info(
-                "SKIP %s — YES price %d¢ >= threshold %d¢",
-                crossing.city,
-                price.yes_price_cents,
-                TRADING.max_buy_price_cents,
-            )
+
+    # NOTE: Old _handle_crossing method removed - now using continuous evaluation
+    # in _trading_loop instead of reactive bracket crossing approach
 
     async def _load_brackets_for_all(self) -> None:
         """Load today's bracket definitions from Kalshi for all cities."""
@@ -272,16 +348,11 @@ class WeatherBot:
                         obs_date,
                     )
 
-    def _print_status(self) -> None:
-        """Print current bot status."""
+    def _print_metar_status(self) -> None:
+        """Print METAR status."""
         status = self.tracker.get_status()
         logger.info("=" * 50)
-        logger.info(
-            "Status — Cycle %d | Crossings: %d | Trades: %d",
-            self._cycle_count,
-            self._total_crossings,
-            self._total_trades,
-        )
+        logger.info("METAR Status — Cycle %d | Crossings: %d", self._cycle_count, self._total_crossings)
         for icao, s in status.items():
             logger.info(
                 "  %s (%s): max=%.1f°F bracket=%s obs=%d",
@@ -291,6 +362,31 @@ class WeatherBot:
                 s["current_bracket"] or "—",
                 s["observations"],
             )
+        logger.info("=" * 50)
+
+    def _print_trading_status(self) -> None:
+        """Print trading status."""
+        summary = self.portfolio.get_summary()
+        logger.info("=" * 50)
+        logger.info(
+            "Trading Status — Cycle %d | Trades: %d | Open Positions: %d",
+            self._trading_cycle_count,
+            self._total_trades,
+            summary["open_positions"],
+        )
+        logger.info(
+            "  Capital: $%.2f | Cash: $%.2f | P&L: $%+.2f (%.1f%%)",
+            summary["total_capital"],
+            summary["current_cash"],
+            summary["realized_pnl"],
+            summary["roi_percent"],
+        )
+        logger.info(
+            "  Win Rate: %.1f%% (%d/%d)",
+            summary["win_rate"],
+            summary["winning_trades"],
+            summary["total_trades"] if summary["total_trades"] > 0 else 1,
+        )
         logger.info("=" * 50)
 
     def stop(self) -> None:

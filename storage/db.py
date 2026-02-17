@@ -80,6 +80,53 @@ CREATE TABLE IF NOT EXISTS portfolio_snapshots (
     open_positions INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS positions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT NOT NULL UNIQUE,
+    city TEXT NOT NULL,
+    bracket_label TEXT NOT NULL,
+    side TEXT NOT NULL,                 -- 'YES' or 'NO'
+    entry_time TEXT NOT NULL,
+    entry_price_cents INTEGER NOT NULL,
+    contracts INTEGER NOT NULL,
+    entry_cost_cents INTEGER NOT NULL,
+
+    -- Exit fields (NULL while open)
+    exit_time TEXT,
+    exit_price_cents INTEGER,
+    exit_proceeds_cents INTEGER,
+    exit_reason TEXT,                   -- 'take_profit', 'stop_loss', 'market_close', 'settlement'
+    realized_pnl_cents INTEGER,
+
+    status TEXT NOT NULL DEFAULT 'open',  -- 'open' or 'closed'
+
+    -- Portfolio state at entry
+    portfolio_cash_before INTEGER,
+    portfolio_capital_before INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS trade_evaluations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    evaluation_time TEXT NOT NULL,
+    city TEXT NOT NULL,
+    ticker TEXT NOT NULL,
+    bracket_label TEXT NOT NULL,
+    current_temp_f REAL NOT NULL,
+    bracket_distance_f REAL NOT NULL,   -- Distance from current temp to bracket
+    time_of_day_local TEXT NOT NULL,
+
+    -- Market data
+    yes_price_cents INTEGER NOT NULL,
+    no_price_cents INTEGER NOT NULL,
+
+    -- Decision
+    action TEXT NOT NULL,               -- 'BUY_YES', 'BUY_NO', 'SKIP', 'HOLD'
+    skip_reason TEXT,
+
+    -- If action taken
+    position_id INTEGER REFERENCES positions(id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_obs_station_time
     ON observations(station_icao, observation_time);
 
@@ -88,6 +135,21 @@ CREATE INDEX IF NOT EXISTS idx_crossings_city_time
 
 CREATE INDEX IF NOT EXISTS idx_portfolio_time
     ON portfolio_snapshots(snapshot_time);
+
+CREATE INDEX IF NOT EXISTS idx_positions_status
+    ON positions(status);
+
+CREATE INDEX IF NOT EXISTS idx_positions_ticker
+    ON positions(ticker);
+
+CREATE INDEX IF NOT EXISTS idx_positions_city_status
+    ON positions(city, status);
+
+CREATE INDEX IF NOT EXISTS idx_eval_time
+    ON trade_evaluations(evaluation_time);
+
+CREATE INDEX IF NOT EXISTS idx_eval_city
+    ON trade_evaluations(city);
 """
 
 
@@ -240,3 +302,174 @@ class Database:
             (f"{target_date}%",),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def open_position(
+        self,
+        ticker: str,
+        city: str,
+        bracket_label: str,
+        side: str,
+        entry_price_cents: int,
+        contracts: int,
+        portfolio_cash: int,
+        portfolio_capital: int,
+    ) -> int:
+        """
+        Record a new open position.
+        Returns position ID.
+        """
+        entry_cost = entry_price_cents * contracts
+        cursor = self.conn.execute(
+            """INSERT INTO positions
+               (ticker, city, bracket_label, side, entry_time, entry_price_cents,
+                contracts, entry_cost_cents, portfolio_cash_before,
+                portfolio_capital_before, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')""",
+            (
+                ticker,
+                city,
+                bracket_label,
+                side,
+                datetime.now(timezone.utc).isoformat(),
+                entry_price_cents,
+                contracts,
+                entry_cost,
+                portfolio_cash,
+                portfolio_capital,
+            ),
+        )
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def close_position(
+        self,
+        position_id: int,
+        exit_price_cents: int,
+        exit_reason: str,
+    ) -> None:
+        """Update a position to closed status with exit details."""
+        # Get position details to calculate proceeds
+        row = self.conn.execute(
+            "SELECT contracts, side FROM positions WHERE id = ?",
+            (position_id,),
+        ).fetchone()
+
+        if row is None:
+            logger.error(f"Position {position_id} not found")
+            return
+
+        contracts = row["contracts"]
+        side = row["side"]
+
+        # Calculate proceeds based on side
+        if side == "YES":
+            # YES position: payout is exit_price * contracts
+            exit_proceeds = exit_price_cents * contracts
+        else:  # NO position
+            # NO position: bought NO at entry_price, exit at (100 - yes_price)
+            # If we sell NO, we get the current NO price
+            exit_proceeds = exit_price_cents * contracts
+
+        # Calculate realized P&L
+        entry_cost = self.conn.execute(
+            "SELECT entry_cost_cents FROM positions WHERE id = ?",
+            (position_id,),
+        ).fetchone()["entry_cost_cents"]
+        realized_pnl = exit_proceeds - entry_cost
+
+        self.conn.execute(
+            """UPDATE positions
+               SET exit_time = ?, exit_price_cents = ?, exit_proceeds_cents = ?,
+                   exit_reason = ?, realized_pnl_cents = ?, status = 'closed'
+               WHERE id = ?""",
+            (
+                datetime.now(timezone.utc).isoformat(),
+                exit_price_cents,
+                exit_proceeds,
+                exit_reason,
+                realized_pnl,
+                position_id,
+            ),
+        )
+        self.conn.commit()
+
+    def get_open_positions(self) -> list[dict]:
+        """Get all open positions."""
+        rows = self.conn.execute(
+            """SELECT * FROM positions WHERE status = 'open'
+               ORDER BY entry_time DESC""",
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_position_by_ticker(self, ticker: str) -> Optional[dict]:
+        """Get position by ticker (for checking if position exists)."""
+        row = self.conn.execute(
+            "SELECT * FROM positions WHERE ticker = ?",
+            (ticker,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def record_trade_evaluation(
+        self,
+        city: str,
+        ticker: str,
+        bracket_label: str,
+        current_temp_f: float,
+        bracket_distance_f: float,
+        time_of_day_local: str,
+        yes_price_cents: int,
+        no_price_cents: int,
+        action: str,
+        skip_reason: Optional[str] = None,
+        position_id: Optional[int] = None,
+    ) -> int:
+        """Log a trade evaluation decision."""
+        cursor = self.conn.execute(
+            """INSERT INTO trade_evaluations
+               (evaluation_time, city, ticker, bracket_label, current_temp_f,
+                bracket_distance_f, time_of_day_local, yes_price_cents,
+                no_price_cents, action, skip_reason, position_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                datetime.now(timezone.utc).isoformat(),
+                city,
+                ticker,
+                bracket_label,
+                current_temp_f,
+                bracket_distance_f,
+                time_of_day_local,
+                yes_price_cents,
+                no_price_cents,
+                action,
+                skip_reason,
+                position_id,
+            ),
+        )
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def record_portfolio_snapshot(self, portfolio) -> int:
+        """Save current portfolio state."""
+        from engine.portfolio import Portfolio
+
+        summary = portfolio.get_summary()
+        cursor = self.conn.execute(
+            """INSERT INTO portfolio_snapshots
+               (snapshot_time, cash_cents, positions_value_cents, total_capital_cents,
+                realized_pnl_cents, total_trades, winning_trades, losing_trades,
+                open_positions)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                datetime.now(timezone.utc).isoformat(),
+                portfolio.current_cash_cents,
+                portfolio.positions_value_cents,
+                portfolio.total_capital_cents,
+                portfolio.realized_pnl_cents,
+                portfolio.total_trades,
+                portfolio.winning_trades,
+                portfolio.losing_trades,
+                len(portfolio.positions),
+            ),
+        )
+        self.conn.commit()
+        return cursor.lastrowid

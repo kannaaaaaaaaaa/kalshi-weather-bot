@@ -26,6 +26,7 @@ class Position:
     ticker: str
     city: str
     bracket_label: str
+    side: str  # 'YES' or 'NO'
     entry_time: datetime
     entry_price_cents: int  # Price paid per contract
     contracts: int
@@ -37,7 +38,7 @@ class Position:
 
     @property
     def max_profit_cents(self) -> int:
-        """Max profit if position wins (YES goes to 100¢)."""
+        """Max profit if position wins."""
         return (100 - self.entry_price_cents) * self.contracts
 
     def settle(self, won: bool) -> int:
@@ -50,13 +51,22 @@ class Position:
         Returns:
             Profit/loss in cents (positive = profit, negative = loss)
         """
-        if won:
-            # Win: receive $1 per contract
-            payout = 100 * self.contracts
-            return payout - self.cost_cents
-        else:
-            # Loss: position expires worthless
-            return -self.cost_cents
+        if self.side == "YES":
+            if won:
+                # YES wins: receive $1 per contract
+                payout = 100 * self.contracts
+                return payout - self.cost_cents
+            else:
+                # YES loses: position expires worthless
+                return -self.cost_cents
+        else:  # NO position
+            if won:
+                # NO wins: receive $1 per contract
+                payout = 100 * self.contracts
+                return payout - self.cost_cents
+            else:
+                # NO loses: position expires worthless
+                return -self.cost_cents
 
 
 @dataclass
@@ -162,11 +172,15 @@ class Portfolio:
         ticker: str,
         city: str,
         bracket_label: str,
+        side: str,
         entry_price_cents: int,
         contracts: int,
     ) -> bool:
         """
         Open a new position.
+
+        Args:
+            side: 'YES' or 'NO'
 
         Returns:
             True if position opened successfully, False if insufficient funds
@@ -189,6 +203,7 @@ class Portfolio:
             ticker=ticker,
             city=city,
             bracket_label=bracket_label,
+            side=side,
             entry_time=datetime.now(timezone.utc),
             entry_price_cents=entry_price_cents,
             contracts=contracts,
@@ -196,7 +211,8 @@ class Portfolio:
         self.positions[ticker] = position
 
         logger.info(
-            "OPEN: %s | %d @ %d¢ = %d¢ | Cash: %d¢ -> %d¢",
+            "OPEN: %s %s | %d @ %d¢ = %d¢ | Cash: %d¢ -> %d¢",
+            side,
             ticker,
             contracts,
             entry_price_cents,

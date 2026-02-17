@@ -150,6 +150,43 @@ class TradingConfig:
     # Maximum contracts per trade (hard limit)
     max_contracts_per_trade: int = 20
 
+    # Two-sided trading parameters
+    enable_two_sided_trading: bool = True
+    enable_active_exits: bool = True
+
+    # Entry thresholds for YES positions
+    yes_entry_current_bracket_max: int = 80  # Buy YES if < 80¢ for current bracket
+    yes_entry_adjacent_bracket_max: int = 60  # Buy YES if < 60¢ for adjacent bracket
+    yes_entry_far_bracket_max: int = 50  # Buy YES if < 50¢ for far brackets
+
+    # Entry thresholds for NO positions
+    no_entry_far_bracket_max: int = 70  # Buy NO if < 70¢ for far brackets (YES > 30¢)
+    no_entry_crossed_bracket_max: int = 80  # Buy NO if < 80¢ for crossed brackets
+
+    # Exit thresholds
+    take_profit_cents: int = 15  # Exit if +15¢ gain
+    take_profit_percent: float = 25.0  # OR +25% ROI
+    stop_loss_percent: float = 30.0  # Exit if -30% loss
+    lock_profit_price: int = 90  # Exit if price reaches 90¢+
+
+    # Position limits (risk management)
+    max_positions_per_city: int = 5
+    max_total_positions: int = 20
+    max_position_pct_of_portfolio: float = 50.0  # Max % of portfolio in single position
+    max_deployed_capital_pct: float = 80.0  # Keep 20% cash reserve
+
+    # Trading frequency
+    evaluation_interval_seconds: int = 30  # Check opportunities every 30s
+
+    # Daily risk limits
+    max_trades_per_day: int = 20
+    daily_loss_limit_pct: float = 20.0
+
+    # Data quality thresholds
+    max_data_staleness_seconds: int = 600  # 10 minutes
+    min_market_volume: int = 100  # Skip if volume < 100
+    max_spread_cents: int = 20  # Skip if spread > 20¢
+
 
 # --- Database ---
 
