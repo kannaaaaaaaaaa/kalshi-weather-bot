@@ -165,7 +165,8 @@ class TradingConfig:
 
     # Exit thresholds
     take_profit_cents: int = 15  # Exit if +15¢ gain
-    take_profit_percent: float = 25.0  # OR +25% ROI
+    take_profit_percent: float = 25.0  # OR +25% ROI (only if gain >= take_profit_min_cents)
+    take_profit_min_cents: int = 5  # Minimum absolute gain before % exit triggers
     stop_loss_percent: float = 30.0  # Exit if -30% loss
     lock_profit_price: int = 90  # Exit if price reaches 90¢+
 

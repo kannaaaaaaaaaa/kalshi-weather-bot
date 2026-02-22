@@ -2,10 +2,13 @@
 View paper trading results from the weather bot database.
 
 Usage:
-    python view_results.py                    # Show all-time summary
-    python view_results.py --today            # Show today's results
-    python view_results.py --week             # Show last 7 days
-    python view_results.py --detailed         # Show all trades with details
+    python view_results.py                    # Portfolio summary + open positions
+    python view_results.py --today            # Filter to today only
+    python view_results.py --week             # Filter to last 7 days
+    python view_results.py --positions        # Show all open positions
+    python view_results.py --closed           # Show closed positions + P&L
+    python view_results.py --evals            # Show trade evaluations (what was looked at)
+    python view_results.py --all              # Show everything
 """
 
 import sqlite3
@@ -13,270 +16,313 @@ import argparse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
-from collections import defaultdict
 
 
-class ResultsViewer:
-    """View and analyze paper trading results."""
-
-    def __init__(self, db_path: str = "data/weather_bot.db"):
-        self.db_path = db_path
-        if not Path(db_path).exists():
-            raise FileNotFoundError(f"Database not found: {db_path}")
-        self.conn = sqlite3.connect(db_path)
-        self.conn.row_factory = sqlite3.Row
-
-    def get_summary(self, start_date: Optional[str] = None) -> dict:
-        """Get summary statistics for paper trades."""
-        date_filter = ""
-        params = []
-
-        if start_date:
-            date_filter = "WHERE trade_time >= ?"
-            params.append(start_date)
-
-        # Overall stats
-        overall = self.conn.execute(
-            f"""SELECT
-                COUNT(*) as total_decisions,
-                SUM(CASE WHEN action = 'BUY_YES' THEN 1 ELSE 0 END) as total_buys,
-                SUM(CASE WHEN action = 'SKIP' THEN 1 ELSE 0 END) as total_skips,
-                SUM(CASE WHEN action = 'BUY_YES' THEN entry_cost_cents ELSE 0 END) as total_cost_cents,
-                SUM(CASE WHEN action = 'BUY_YES' THEN potential_profit_cents ELSE 0 END) as total_potential_profit,
-                SUM(CASE WHEN action = 'BUY_YES' THEN position_size ELSE 0 END) as total_contracts,
-                AVG(CASE WHEN action = 'BUY_YES' THEN market_yes_price_cents END) as avg_entry_price
-            FROM paper_trades
-            {date_filter}""",
-            params
-        ).fetchone()
-
-        # Per-city breakdown
-        by_city = self.conn.execute(
-            f"""SELECT
-                city,
-                COUNT(*) as decisions,
-                SUM(CASE WHEN action = 'BUY_YES' THEN 1 ELSE 0 END) as buys,
-                SUM(CASE WHEN action = 'BUY_YES' THEN potential_profit_cents ELSE 0 END) as potential_profit
-            FROM paper_trades
-            {date_filter}
-            GROUP BY city
-            ORDER BY buys DESC""",
-            params
-        ).fetchall()
-
-        # Skip reasons breakdown
-        skip_reasons = self.conn.execute(
-            f"""SELECT
-                skip_reason,
-                COUNT(*) as count
-            FROM paper_trades
-            WHERE action = 'SKIP' {' AND trade_time >= ?' if start_date else ''}
-            GROUP BY skip_reason
-            ORDER BY count DESC""",
-            params if start_date else []
-        ).fetchall()
-
-        return {
-            'overall': dict(overall),
-            'by_city': [dict(row) for row in by_city],
-            'skip_reasons': [dict(row) for row in skip_reasons]
-        }
-
-    def get_all_trades(self, start_date: Optional[str] = None) -> list[dict]:
-        """Get all paper trades with full details."""
-        date_filter = ""
-        params = []
-
-        if start_date:
-            date_filter = "WHERE pt.trade_time >= ?"
-            params.append(start_date)
-
-        trades = self.conn.execute(
-            f"""SELECT
-                pt.trade_time,
-                pt.city,
-                pt.bracket_label,
-                pt.action,
-                pt.skip_reason,
-                pt.market_yes_price_cents,
-                pt.position_size,
-                pt.entry_cost_cents,
-                pt.potential_profit_cents,
-                bc.observed_temp_f,
-                bc.daily_max_f,
-                bc.confidence,
-                bc.latency_seconds
-            FROM paper_trades pt
-            JOIN bracket_crossings bc ON pt.crossing_id = bc.id
-            {date_filter}
-            ORDER BY pt.trade_time DESC""",
-            params
-        ).fetchall()
-
-        return [dict(row) for row in trades]
-
-    def get_crossings_summary(self, start_date: Optional[str] = None) -> dict:
-        """Get bracket crossing statistics."""
-        date_filter = ""
-        params = []
-
-        if start_date:
-            date_filter = "WHERE signal_time >= ?"
-            params.append(start_date)
-
-        stats = self.conn.execute(
-            f"""SELECT
-                COUNT(*) as total_crossings,
-                AVG(latency_seconds) as avg_latency,
-                MIN(latency_seconds) as min_latency,
-                MAX(latency_seconds) as max_latency,
-                SUM(CASE WHEN confidence = 'high' THEN 1 ELSE 0 END) as high_confidence,
-                SUM(CASE WHEN confidence = 'low' THEN 1 ELSE 0 END) as low_confidence
-            FROM bracket_crossings
-            {date_filter}""",
-            params
-        ).fetchone()
-
-        return dict(stats)
-
-    def close(self):
-        self.conn.close()
+def connect(db_path: str) -> sqlite3.Connection:
+    if not Path(db_path).exists():
+        raise FileNotFoundError(f"Database not found: {db_path}")
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-def print_separator(char="=", length=80):
+def sep(char="=", length=80):
     print(char * length)
 
 
-def print_summary(viewer: ResultsViewer, start_date: Optional[str] = None, title: str = "PAPER TRADING SUMMARY"):
-    """Print formatted summary of results."""
-    print_separator()
-    print(f"  {title}")
-    print_separator()
-
-    summary = viewer.get_summary(start_date)
-    overall = summary['overall']
-
-    # Overall statistics
-    print("\n📊 OVERALL PERFORMANCE")
-    print_separator("-")
-    print(f"  Total Decisions:        {overall['total_decisions']}")
-    print(f"  Trades Executed:        {overall['total_buys']} ({overall['total_buys']/max(overall['total_decisions'],1)*100:.1f}%)")
-    print(f"  Trades Skipped:         {overall['total_skips']} ({overall['total_skips']/max(overall['total_decisions'],1)*100:.1f}%)")
-
-    if overall['total_buys'] > 0:
-        total_cost = overall['total_cost_cents'] / 100
-        total_potential = overall['total_potential_profit'] / 100
-        avg_price = overall['avg_entry_price']
-
-        print(f"\n💰 FINANCIALS (if all trades won)")
-        print_separator("-")
-        print(f"  Total Contracts:        {overall['total_contracts']}")
-        print(f"  Total Investment:       ${total_cost:.2f}")
-        print(f"  Potential Profit:       ${total_potential:.2f}")
-        print(f"  Potential ROI:          {(total_potential/max(total_cost,0.01))*100:.1f}%")
-        print(f"  Average Entry Price:    {avg_price:.0f}¢")
-        print(f"  Average Max Profit:     ${total_potential/overall['total_buys']:.2f} per trade")
-
-    # Per-city breakdown
-    if summary['by_city']:
-        print(f"\n🌆 BY CITY")
-        print_separator("-")
-        print(f"  {'City':<15} {'Decisions':<12} {'Buys':<10} {'Potential $':<15}")
-        print_separator("-")
-        for city in summary['by_city']:
-            potential = (city['potential_profit'] or 0) / 100
-            print(f"  {city['city']:<15} {city['decisions']:<12} {city['buys']:<10} ${potential:>12.2f}")
-
-    # Skip reasons
-    if summary['skip_reasons']:
-        print(f"\n⏭️  SKIP REASONS")
-        print_separator("-")
-        for reason in summary['skip_reasons']:
-            if reason['skip_reason']:
-                print(f"  {reason['skip_reason']:<40} {reason['count']:>5}x")
-
-    # Crossing statistics
-    crossings = viewer.get_crossings_summary(start_date)
-    if crossings['total_crossings'] > 0:
-        print(f"\n⚡ SIGNAL LATENCY")
-        print_separator("-")
-        print(f"  Total Crossings:        {crossings['total_crossings']}")
-        print(f"  High Confidence:        {crossings['high_confidence']} ({crossings['high_confidence']/crossings['total_crossings']*100:.1f}%)")
-        print(f"  Low Confidence:         {crossings['low_confidence']} ({crossings['low_confidence']/crossings['total_crossings']*100:.1f}%)")
-        print(f"  Average Latency:        {crossings['avg_latency']:.2f}s")
-        print(f"  Min Latency:            {crossings['min_latency']:.2f}s")
-        print(f"  Max Latency:            {crossings['max_latency']:.2f}s")
-
-    print_separator()
+def fmt_cents(c: Optional[int]) -> str:
+    if c is None:
+        return "—"
+    return f"${c/100:+.2f}" if c != 0 else "$0.00"
 
 
-def print_detailed_trades(viewer: ResultsViewer, start_date: Optional[str] = None, limit: int = 20):
-    """Print detailed trade history."""
-    trades = viewer.get_all_trades(start_date)
+def fmt_price(c: Optional[int]) -> str:
+    if c is None:
+        return " —¢"
+    return f"{c:3d}¢"
 
-    if not trades:
-        print("\nNo trades found.")
+
+def fmt_time(iso: Optional[str]) -> str:
+    if not iso:
+        return "—"
+    return datetime.fromisoformat(iso).strftime("%m/%d %H:%M")
+
+
+# ---------------------------------------------------------------------------
+# Portfolio summary
+# ---------------------------------------------------------------------------
+
+def show_portfolio(conn: sqlite3.Connection, since: Optional[str]) -> None:
+    sep()
+    print("  PORTFOLIO SUMMARY")
+    sep()
+
+    # Open positions
+    open_pos = conn.execute(
+        "SELECT * FROM positions WHERE status = 'open' ORDER BY entry_time"
+    ).fetchall()
+
+    # Closed positions (optionally filtered)
+    q = "SELECT * FROM positions WHERE status = 'closed'"
+    params = []
+    if since:
+        q += " AND exit_time >= ?"
+        params.append(since)
+    closed_pos = conn.execute(q + " ORDER BY exit_time DESC", params).fetchall()
+
+    # P&L from closed positions
+    pnl_row = conn.execute(
+        "SELECT SUM(realized_pnl_cents) as total, COUNT(*) as n FROM positions WHERE status = 'closed'"
+    ).fetchone()
+    total_pnl = pnl_row["total"] or 0
+    closed_count = pnl_row["n"] or 0
+
+    win_row = conn.execute(
+        "SELECT COUNT(*) as n FROM positions WHERE status = 'closed' AND realized_pnl_cents > 0"
+    ).fetchone()
+    wins = win_row["n"] or 0
+
+    # Deployed capital
+    deployed = conn.execute(
+        "SELECT SUM(entry_cost_cents) as d FROM positions WHERE status = 'open'"
+    ).fetchone()["d"] or 0
+
+    print(f"\n  Open Positions:   {len(open_pos)}")
+    print(f"  Closed Positions: {closed_count}")
+    print(f"  Deployed Capital: ${deployed/100:.2f}")
+    print(f"  Realized P&L:     {fmt_cents(total_pnl)}")
+    if closed_count > 0:
+        print(f"  Win Rate:         {wins}/{closed_count} ({wins/closed_count*100:.0f}%)")
+
+    # Last portfolio snapshot
+    snap = conn.execute(
+        "SELECT * FROM portfolio_snapshots ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if snap:
+        print(f"\n  --- Last Portfolio Snapshot ({fmt_time(snap['snapshot_time'])}) ---")
+        print(f"  Cash:             ${snap['cash_cents']/100:.2f}")
+        print(f"  Total Capital:    ${snap['total_capital_cents']/100:.2f}")
+        print(f"  ROI:              {(snap['realized_pnl_cents']/(snap['total_capital_cents'] or 1))*100:+.2f}%")
+    sep()
+
+
+# ---------------------------------------------------------------------------
+# Open positions
+# ---------------------------------------------------------------------------
+
+def show_open_positions(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        "SELECT * FROM positions WHERE status = 'open' ORDER BY city, entry_time"
+    ).fetchall()
+
+    sep()
+    print(f"  OPEN POSITIONS ({len(rows)})")
+    sep()
+
+    if not rows:
+        print("  No open positions.")
+        sep()
         return
 
-    print_separator()
-    print(f"  TRADE HISTORY (showing last {min(limit, len(trades))} trades)")
-    print_separator()
+    by_city: dict[str, list] = {}
+    for r in rows:
+        by_city.setdefault(r["city"], []).append(r)
 
-    for i, trade in enumerate(trades[:limit], 1):
-        trade_time = datetime.fromisoformat(trade['trade_time']).strftime('%Y-%m-%d %H:%M:%S')
+    for city, positions in by_city.items():
+        print(f"\n  {city.upper()}")
+        print(f"  {'Side':<5} {'Bracket':<22} {'Entry':<6} {'Qty':<5} {'Cost':<10} {'Entry Time'}")
+        print("  " + "-" * 70)
+        for p in positions:
+            cost = p["entry_price_cents"] * p["contracts"]
+            print(
+                f"  {p['side']:<5} {p['bracket_label']:<22} "
+                f"{fmt_price(p['entry_price_cents']):<6} {p['contracts']:<5} "
+                f"${cost/100:<9.2f} {fmt_time(p['entry_time'])}"
+            )
+    sep()
 
-        print(f"\n[{i}] {trade_time} UTC")
-        print(f"    City: {trade['city']}  |  Bracket: {trade['bracket_label']}")
-        print(f"    Temp: {trade['observed_temp_f']:.1f}°F (daily max: {trade['daily_max_f']:.1f}°F)")
-        print(f"    Confidence: {trade['confidence']}  |  Latency: {trade['latency_seconds']:.1f}s")
 
-        if trade['action'] == 'BUY_YES':
-            cost = trade['entry_cost_cents'] / 100
-            profit = trade['potential_profit_cents'] / 100
-            print(f"    ✅ BOUGHT {trade['position_size']} @ {trade['market_yes_price_cents']}¢")
-            print(f"       Cost: ${cost:.2f}  |  Max Profit: ${profit:.2f}")
-        else:
-            print(f"    ⏭️  SKIPPED: {trade['skip_reason']}")
-            if trade['market_yes_price_cents']:
-                print(f"       Market price was: {trade['market_yes_price_cents']}¢")
+# ---------------------------------------------------------------------------
+# Closed positions
+# ---------------------------------------------------------------------------
 
-    if len(trades) > limit:
-        print(f"\n... and {len(trades) - limit} more trades")
+def show_closed_positions(conn: sqlite3.Connection, since: Optional[str], limit: int) -> None:
+    q = "SELECT * FROM positions WHERE status = 'closed'"
+    params = []
+    if since:
+        q += " AND exit_time >= ?"
+        params.append(since)
+    q += " ORDER BY exit_time DESC LIMIT ?"
+    params.append(limit)
 
-    print_separator()
+    rows = conn.execute(q, params).fetchall()
 
+    sep()
+    print(f"  CLOSED POSITIONS (last {limit})")
+    sep()
+
+    if not rows:
+        print("  No closed positions.")
+        sep()
+        return
+
+    total_pnl = 0
+    wins = 0
+
+    print(f"\n  {'#':<4} {'Side':<5} {'City':<10} {'Bracket':<22} {'Buy':<5} {'Exit':<5} {'P&L':<10} {'Reason':<20} {'Closed'}")
+    print("  " + "-" * 100)
+
+    for i, p in enumerate(rows, 1):
+        pnl = p["realized_pnl_cents"] or 0
+        total_pnl += pnl
+        if pnl > 0:
+            wins += 1
+        pnl_str = f"{fmt_cents(pnl)}"
+
+        print(
+            f"  {i:<4} {p['side']:<5} {p['city']:<10} {p['bracket_label']:<22} "
+            f"{fmt_price(p['entry_price_cents']):<5} {fmt_price(p['exit_price_cents']):<5} "
+            f"{pnl_str:<10} {(p['exit_reason'] or '—'):<20} {fmt_time(p['exit_time'])}"
+        )
+
+    print(f"\n  Net P&L: {fmt_cents(total_pnl)}   Win rate: {wins}/{len(rows)} ({wins/len(rows)*100:.0f}%)")
+    sep()
+
+
+# ---------------------------------------------------------------------------
+# Trade evaluations
+# ---------------------------------------------------------------------------
+
+def show_evaluations(conn: sqlite3.Connection, since: Optional[str], limit: int) -> None:
+    q = "SELECT * FROM trade_evaluations"
+    params = []
+    if since:
+        q += " WHERE evaluation_time >= ?"
+        params.append(since)
+    q += " ORDER BY evaluation_time DESC LIMIT ?"
+    params.append(limit)
+
+    rows = conn.execute(q, params).fetchall()
+
+    # Summary counts
+    summary = conn.execute(
+        "SELECT action, COUNT(*) as n FROM trade_evaluations GROUP BY action"
+    ).fetchall()
+    skip_reasons = conn.execute(
+        "SELECT skip_reason, COUNT(*) as n FROM trade_evaluations WHERE action = 'SKIP' GROUP BY skip_reason ORDER BY n DESC"
+    ).fetchall()
+
+    sep()
+    print(f"  TRADE EVALUATIONS")
+    sep()
+
+    print("\n  Actions:")
+    for row in summary:
+        print(f"    {row['action']:<15} {row['n']:>5}x")
+
+    if skip_reasons:
+        print("\n  Skip Reasons:")
+        for row in skip_reasons:
+            reason = row["skip_reason"] or "(none)"
+            print(f"    {reason:<50} {row['n']:>5}x")
+
+    print(f"\n  Recent Evaluations (last {min(limit, len(rows))}):")
+    print(f"\n  {'Action':<10} {'City':<10} {'Bracket':<22} {'Temp':>6} {'Dist':>6} {'YES':>5} {'NO':>5} {'Skip Reason'}")
+    print("  " + "-" * 100)
+
+    for r in rows:
+        dist = r["bracket_distance_f"]
+        dist_str = f"{dist:+.1f}°" if dist is not None else "—"
+        print(
+            f"  {r['action']:<10} {r['city']:<10} {r['bracket_label']:<22} "
+            f"{r['current_temp_f']:>5.1f}° {dist_str:>6} "
+            f"{fmt_price(r['yes_price_cents']):>5} {fmt_price(r['no_price_cents']):>5}  "
+            f"{r['skip_reason'] or ''}"
+        )
+
+    sep()
+
+
+# ---------------------------------------------------------------------------
+# Crossing history (legacy info)
+# ---------------------------------------------------------------------------
+
+def show_crossings(conn: sqlite3.Connection, since: Optional[str]) -> None:
+    q = "SELECT * FROM bracket_crossings"
+    params = []
+    if since:
+        q += " WHERE signal_time >= ?"
+        params.append(since)
+    q += " ORDER BY signal_time DESC LIMIT 20"
+
+    rows = conn.execute(q, params).fetchall()
+
+    sep()
+    print(f"  BRACKET CROSSINGS (last 20)")
+    sep()
+
+    if not rows:
+        print("  No crossings recorded.")
+        sep()
+        return
+
+    print(f"\n  {'City':<10} {'From':<22} {'To':<22} {'Temp':>6} {'Conf':<8} {'Time'}")
+    print("  " + "-" * 90)
+    for r in rows:
+        old_label = r["old_bracket_label"] or "—"
+        print(
+            f"  {r['city']:<10} {old_label:<22} {r['new_bracket_label']:<22} "
+            f"{r['observed_temp_f']:>5.1f}° {r['confidence']:<8} {fmt_time(r['signal_time'])}"
+        )
+    sep()
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="View Kalshi weather bot paper trading results")
+    parser = argparse.ArgumentParser(description="View Kalshi weather bot results")
     parser.add_argument("--db", default="data/weather_bot.db", help="Database path")
-    parser.add_argument("--today", action="store_true", help="Show only today's results")
-    parser.add_argument("--week", action="store_true", help="Show last 7 days")
-    parser.add_argument("--detailed", action="store_true", help="Show detailed trade history")
-    parser.add_argument("--limit", type=int, default=20, help="Limit for detailed view")
+    parser.add_argument("--today", action="store_true", help="Filter to today")
+    parser.add_argument("--week", action="store_true", help="Filter to last 7 days")
+    parser.add_argument("--positions", action="store_true", help="Show open positions")
+    parser.add_argument("--closed", action="store_true", help="Show closed positions + P&L")
+    parser.add_argument("--evals", action="store_true", help="Show trade evaluations")
+    parser.add_argument("--crossings", action="store_true", help="Show bracket crossings")
+    parser.add_argument("--all", dest="show_all", action="store_true", help="Show everything")
+    parser.add_argument("--limit", type=int, default=30, help="Row limit for detailed views")
     args = parser.parse_args()
 
-    viewer = ResultsViewer(args.db)
+    conn = connect(args.db)
 
-    # Determine date filter
-    start_date = None
-    title = "PAPER TRADING SUMMARY (All Time)"
-
+    # Time filter
+    since = None
     if args.today:
-        start_date = datetime.now(timezone.utc).date().isoformat()
-        title = f"PAPER TRADING SUMMARY (Today - {start_date})"
+        since = datetime.now(timezone.utc).date().isoformat()
     elif args.week:
-        start_date = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-        title = "PAPER TRADING SUMMARY (Last 7 Days)"
+        since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
 
-    # Show summary
-    print_summary(viewer, start_date, title)
+    show_all = args.show_all or not any([
+        args.positions, args.closed, args.evals, args.crossings
+    ])
 
-    # Show detailed trades if requested
-    if args.detailed:
-        print("\n")
-        print_detailed_trades(viewer, start_date, args.limit)
+    if show_all or True:  # Always show portfolio summary
+        show_portfolio(conn, since)
 
-    viewer.close()
+    if show_all or args.positions:
+        show_open_positions(conn)
+
+    if show_all or args.closed:
+        show_closed_positions(conn, since, args.limit)
+
+    if show_all or args.evals:
+        show_evaluations(conn, since, args.limit)
+
+    if args.crossings or args.show_all:
+        show_crossings(conn, since)
+
+    conn.close()
 
 
 if __name__ == "__main__":

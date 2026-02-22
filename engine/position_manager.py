@@ -8,6 +8,8 @@ while integrating with Portfolio and Database.
 from __future__ import annotations
 
 import logging
+import re
+from datetime import datetime, timezone, date
 from typing import Optional
 
 from config.settings import TRADING
@@ -34,6 +36,32 @@ class PositionManager:
         self.kalshi = kalshi
         self.strategy = strategy
 
+    @staticmethod
+    def _ticker_date(ticker: str) -> Optional[date]:
+        """
+        Parse the event date from a Kalshi ticker.
+        Format: KXHIGHNY-26FEB17-T44  ->  2026-02-17
+        """
+        m = re.search(r"-(\d{2})([A-Z]{3})(\d{2})-", ticker)
+        if not m:
+            return None
+        try:
+            return datetime.strptime(f"{m.group(1)}{m.group(2)}{m.group(3)}", "%y%b%d").date()
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _is_tradeable(ticker: str) -> bool:
+        """
+        Return True if the market is current or future — rejects expired markets.
+        Kalshi sometimes opens next-day markets on the evening before, so we
+        allow any date >= today rather than requiring an exact today match.
+        """
+        market_date = PositionManager._ticker_date(ticker)
+        if market_date is None:
+            return True  # Unknown date format — allow it
+        return market_date >= datetime.now(timezone.utc).date()
+
     async def open_position(
         self,
         signal: TradingSignal,
@@ -48,6 +76,11 @@ class PositionManager:
         ticker = signal.bracket.ticker
         price = signal.price_cents
         contracts = signal.contracts
+
+        # Reject expired markets (yesterday or older) — only trade current/future
+        if not self._is_tradeable(ticker):
+            logger.debug("SKIP: %s is an expired market", ticker)
+            return None
 
         # Check position limits
         if not self._check_position_limits(signal.bracket.ticker):
@@ -117,12 +150,8 @@ class PositionManager:
         ticker = position_dict["ticker"]
         side = position_dict["side"]
 
-        # Close in portfolio
-        # For YES: won if price reached 100, lost if expired worthless
-        # For now, we're just simulating by selling at current price
-        won = exit_price_cents >= 90  # Simplified - real logic would check actual settlement
-
-        pnl = self.portfolio.close_position(ticker, won=won)
+        # Early exit: sell at current market price (not binary settlement)
+        pnl = self.portfolio.close_position(ticker, exit_price_cents=exit_price_cents)
 
         if pnl is None:
             logger.error(f"Failed to close position {ticker} in portfolio")
@@ -183,10 +212,14 @@ class PositionManager:
         Returns:
             True if within limits
         """
-        # Check if position already exists
+        # Block re-entry on any ticker already traded (open or closed)
+        # The positions table has a UNIQUE constraint on ticker, so we can't
+        # insert a second row regardless of status.
         existing = self.db.get_position_by_ticker(ticker)
-        if existing and existing["status"] == "open":
-            logger.debug("Position already exists for %s", ticker)
+        if existing:
+            logger.debug(
+                "Position already exists for %s (status: %s)", ticker, existing["status"]
+            )
             return False
 
         # Check total position limit
@@ -216,36 +249,48 @@ class PositionManager:
 
     def load_portfolio_from_db(self) -> None:
         """
-        Load open positions from database and restore portfolio state.
+        Restore portfolio state from the database on bot startup/restart.
 
-        Call this on bot startup to recover from restarts.
+        Loads cash balance from the last portfolio snapshot, then re-adds
+        open positions WITHOUT re-deducting cash (already deducted in the
+        original run).
         """
-        open_positions = self.db.get_open_positions()
+        # Step 1: restore cash from last snapshot
+        snap = self.db.conn.execute(
+            "SELECT cash_cents FROM portfolio_snapshots ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if snap:
+            self.portfolio.current_cash_cents = snap["cash_cents"]
+            logger.info(
+                "Restored portfolio cash from snapshot: %d¢ ($%.2f)",
+                snap["cash_cents"],
+                snap["cash_cents"] / 100,
+            )
+        else:
+            logger.info("No portfolio snapshot found — starting with fresh capital")
 
+        # Step 2: re-add open positions without deducting cash
+        open_positions = self.db.get_open_positions()
         if not open_positions:
             logger.info("No open positions to restore")
             return
 
         logger.info("Restoring %d open positions from database", len(open_positions))
-
         for pos in open_positions:
-            # Add position to portfolio
-            success = self.portfolio.open_position(
+            entry_time = datetime.fromisoformat(pos["entry_time"])
+            self.portfolio.restore_position(
                 ticker=pos["ticker"],
                 city=pos["city"],
                 bracket_label=pos["bracket_label"],
                 side=pos["side"],
+                entry_time=entry_time,
                 entry_price_cents=pos["entry_price_cents"],
                 contracts=pos["contracts"],
             )
-
-            if success:
-                logger.debug(
-                    "Restored %s position: %s | %d @ %d¢",
-                    pos["side"],
-                    pos["ticker"],
-                    pos["contracts"],
-                    pos["entry_price_cents"],
-                )
-            else:
-                logger.error("Failed to restore position %s", pos["ticker"])
+            logger.debug(
+                "Restored %s %s | %d @ %d¢",
+                pos["side"],
+                pos["ticker"],
+                pos["contracts"],
+                pos["entry_price_cents"],
+            )

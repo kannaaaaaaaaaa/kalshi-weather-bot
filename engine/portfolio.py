@@ -167,6 +167,32 @@ class Portfolio:
 
         return max(0, contracts)  # Never negative
 
+    def restore_position(
+        self,
+        ticker: str,
+        city: str,
+        bracket_label: str,
+        side: str,
+        entry_time: datetime,
+        entry_price_cents: int,
+        contracts: int,
+    ) -> None:
+        """
+        Re-add a position to tracking after a restart WITHOUT deducting cash.
+        Cash was already deducted when the position was originally opened.
+        Only call this during portfolio restore from the database.
+        """
+        position = Position(
+            ticker=ticker,
+            city=city,
+            bracket_label=bracket_label,
+            side=side,
+            entry_time=entry_time,
+            entry_price_cents=entry_price_cents,
+            contracts=contracts,
+        )
+        self.positions[ticker] = position
+
     def open_position(
         self,
         ticker: str,
@@ -223,13 +249,25 @@ class Portfolio:
 
         return True
 
-    def close_position(self, ticker: str, won: bool) -> Optional[int]:
+    def close_position(
+        self,
+        ticker: str,
+        exit_price_cents: Optional[int] = None,
+        won: Optional[bool] = None,
+    ) -> Optional[int]:
         """
         Close a position and realize P&L.
 
+        For early exits (take-profit / stop-loss), pass exit_price_cents — proceeds
+        are calculated as exit_price * contracts so the portfolio cash reflects the
+        actual sale price, not a binary settlement.
+
+        For settlement, pass won=True/False — pays out $1/contract on win, $0 on loss.
+
         Args:
             ticker: Position ticker to close
-            won: True if position won, False if lost
+            exit_price_cents: Actual sale price per contract (early exit)
+            won: Settlement outcome (True = win, False = loss)
 
         Returns:
             Realized P&L in cents, or None if position not found
@@ -239,18 +277,27 @@ class Portfolio:
             return None
 
         position = self.positions[ticker]
-        pnl = position.settle(won)
+
+        if exit_price_cents is not None:
+            # Early exit at a specific price — use actual proceeds
+            proceeds = exit_price_cents * position.contracts
+            pnl = proceeds - position.cost_cents
+            self.current_cash_cents += proceeds
+        elif won is not None:
+            # Settlement — binary outcome
+            pnl = position.settle(won)
+            if won:
+                self.current_cash_cents += position.contracts * 100
+        else:
+            logger.warning("close_position called with neither exit_price_cents nor won")
+            return None
 
         # Update stats
         self.total_trades += 1
-        if won:
+        if pnl > 0:
             self.winning_trades += 1
-            # Return full payout
-            payout = position.contracts * 100
-            self.current_cash_cents += payout
         else:
             self.losing_trades += 1
-            # Position expires worthless, no payout
 
         self.realized_pnl_cents += pnl
 

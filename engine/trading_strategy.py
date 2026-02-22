@@ -299,7 +299,10 @@ class TradingStrategy:
         if gain_cents >= TRADING.take_profit_cents:
             return True, f"take_profit_cents (+{gain_cents}¢)"
 
-        if gain_percent >= TRADING.take_profit_percent:
+        # Only apply percentage exit when the absolute gain is meaningful —
+        # prevents exiting 4¢ positions on a 1¢ bid/ask spread move
+        if (gain_percent >= TRADING.take_profit_percent
+                and gain_cents >= TRADING.take_profit_min_cents):
             return True, f"take_profit_percent (+{gain_percent:.1f}%)"
 
         if current_side_price >= TRADING.lock_profit_price:
