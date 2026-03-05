@@ -134,9 +134,13 @@ class KalshiClient:
 
         market = data.get("market", {})
         # Kalshi uses yes_ask/no_ask for buy prices (what we'd pay)
-        # Use last_price as fallback, then mid-price
-        yes_price = market.get("yes_ask") or market.get("last_price") or 0
-        no_price = market.get("no_ask") or (100 - yes_price) if yes_price > 0 else 0
+        # Use last_price as fallback — must use `is not None` since 0 is valid
+        yes_ask = market.get("yes_ask")
+        last_price = market.get("last_price")
+        yes_price = yes_ask if yes_ask is not None else (last_price if last_price is not None else 0)
+
+        no_ask = market.get("no_ask")
+        no_price = no_ask if no_ask is not None else (100 - yes_price)
 
         return MarketPrice(
             ticker=market.get("ticker", ticker),
@@ -166,8 +170,13 @@ class KalshiClient:
         for market in data.get("markets", []):
             ticker = market.get("ticker", "")
             # Kalshi uses yes_ask/no_ask for buy prices (what we'd pay)
-            yes_price = market.get("yes_ask") or market.get("last_price") or 0
-            no_price = market.get("no_ask") or (100 - yes_price) if yes_price > 0 else 0
+            # Must use `is not None` since 0 is a valid price
+            yes_ask = market.get("yes_ask")
+            last_price = market.get("last_price")
+            yes_price = yes_ask if yes_ask is not None else (last_price if last_price is not None else 0)
+
+            no_ask = market.get("no_ask")
+            no_price = no_ask if no_ask is not None else (100 - yes_price)
 
             prices[ticker] = MarketPrice(
                 ticker=ticker,

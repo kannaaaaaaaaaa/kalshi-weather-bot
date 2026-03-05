@@ -1,15 +1,34 @@
 """
 Trading strategy logic for two-sided weather market trading.
 
-Evaluates brackets based on temperature, time of day, and distance from current temp
-to decide when to buy YES (bracket likely to hit) or NO (bracket unlikely to hit).
+Key design principle: The Kalshi daily-high market has exactly ONE winning bracket
+(the one containing the final daily high). Every probability estimate must answer:
+"What is the chance the final daily high lands in THIS bracket's range?"
+
+Since the daily high can only increase during the day:
+  - Brackets BELOW the current daily max: YES probability = ~0%
+    (the final high is already above their range — they can't win)
+  - The CURRENT bracket: moderate probability (temp might stay here or rise further)
+  - Brackets ABOVE the current: decreasing probability with distance
+
+The NWS official high-temperature forecast is the best publicly available predictor
+of the final settlement temperature. When available, we build a probability
+distribution centered on the forecast (sigma ~3°F) rather than using a crude
+distance heuristic.
+
+Signal quality filters (all must pass before generating a trade):
+  1. Minimum price floor: don't buy YES < 10¢ or NO < 5¢
+  2. Market-divergence check: if our probability differs from the market-implied
+     probability by > 30pp, the market knows something we don't — skip
+  3. Time cutoff: no new entries after 4 PM local (daily high is essentially set)
 """
 
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
-from datetime import datetime, time
+from datetime import datetime
 from typing import Optional
 
 from config.settings import TRADING, STATIONS
@@ -35,8 +54,8 @@ class TradingStrategy:
     """
     Encapsulates all trading logic and decision-making.
 
-    Uses temperature-based heuristics to estimate bracket probability,
-    then compares to market prices to find mispricing.
+    Estimates the probability that the final daily high lands in each
+    bracket, then compares to market prices to identify mispriced contracts.
     """
 
     def __init__(self):
@@ -51,135 +70,264 @@ class TradingStrategy:
         local_time: datetime,
         market_price: MarketPrice,
         portfolio,
+        forecast_high_f: Optional[float] = None,
     ) -> TradingSignal:
         """
         Evaluate whether to trade a specific bracket.
 
         Args:
             bracket: The bracket to evaluate
-            current_temp_f: Current temperature
+            current_temp_f: Current temperature reading
             daily_max_f: Daily maximum so far
             current_bracket_index: Index of bracket containing daily max
-            local_time: Current local time
-            market_price: Current market prices
+            local_time: Current local time (for time-of-day logic)
+            market_price: Current market prices from Kalshi
             portfolio: Portfolio for position sizing
+            forecast_high_f: NWS official high forecast (None = use heuristic)
 
         Returns:
             TradingSignal with recommended action
         """
-        # Calculate distance from daily max to this bracket
-        distance = self._calculate_bracket_distance(bracket, daily_max_f)
+        # Hard cutoff: no new entries outside trading window
+        if local_time.hour >= TRADING.no_new_entries_after_hour:
+            return TradingSignal(
+                action="SKIP",
+                bracket=bracket,
+                price_cents=0,
+                contracts=0,
+                reason="",
+                skip_reason=f"Past entry cutoff ({local_time.hour} >= {TRADING.no_new_entries_after_hour})",
+            )
+        if local_time.hour < TRADING.no_new_entries_before_hour:
+            return TradingSignal(
+                action="SKIP",
+                bracket=bracket,
+                price_cents=0,
+                contracts=0,
+                reason="",
+                skip_reason=f"Before entry window ({local_time.hour} < {TRADING.no_new_entries_before_hour})",
+            )
 
-        # Get time-of-day factor (warming vs. cooling phase)
         time_factor = self._get_time_factor(local_time)
 
-        # Estimate probability this bracket will be hit
         probability = self._estimate_bracket_probability(
-            bracket,
-            current_bracket_index,
-            daily_max_f,
-            distance,
-            time_factor,
+            bracket=bracket,
+            current_bracket_index=current_bracket_index,
+            daily_max_f=daily_max_f,
+            time_factor=time_factor,
+            forecast_high_f=forecast_high_f,
         )
 
-        # Generate signal based on probability vs. market price
         return self._generate_signal(
-            bracket,
-            probability,
-            market_price,
-            portfolio,
-            distance,
-            time_factor,
+            bracket=bracket,
+            probability=probability,
+            market_price=market_price,
+            portfolio=portfolio,
+            time_factor=time_factor,
         )
 
-    def _calculate_bracket_distance(self, bracket: Bracket, daily_max_f: float) -> float:
-        """
-        Calculate distance in degrees from daily max to bracket.
-
-        Returns:
-            Positive if bracket is above daily max, negative if below
-        """
-        if bracket.lower_f is None:
-            # Open-ended low bracket
-            return bracket.upper_f - daily_max_f
-        elif bracket.upper_f is None:
-            # Open-ended high bracket
-            return bracket.lower_f - daily_max_f
-        else:
-            # Middle bracket - distance to lower bound
-            return bracket.lower_f - daily_max_f
+    # ------------------------------------------------------------------
+    # Time of day
+    # ------------------------------------------------------------------
 
     def _get_time_factor(self, local_time: datetime) -> float:
         """
-        Get time-of-day factor.
+        Returns a factor representing warming potential at this hour.
 
-        Returns:
-            1.0 = peak warming period (noon-2pm)
-            0.5 = morning warming (6am-noon)
-            0.0 = cooling period (after 4pm)
-            -0.5 = evening (after 6pm)
+        1.0  = high warming potential (morning 10am-noon)
+        0.8  = peak heat (noon-2pm) — less warming LEFT (already near max)
+        0.3  = early afternoon (2pm-4pm, winding down)
+        0.0  = cooling starts (4pm-6pm)
+        -0.5 = evening/night (after 6pm or before 10am)
+
+        Before 10 AM the daily max is unreliable — overnight lows, early
+        morning temps don't predict the day's high. The morning cutoff in
+        evaluate_bracket_opportunity blocks trading, but if we somehow get
+        here, return high warming potential so we don't over-trust daily_max.
         """
         hour = local_time.hour
-
-        if 12 <= hour < 14:
-            return 1.0  # Peak warming
-        elif 6 <= hour < 12:
-            return 0.5  # Morning warming
+        if 10 <= hour < 12:
+            return 1.0   # Strong warming underway
+        elif 12 <= hour < 14:
+            return 0.8   # Near peak, less upside left
         elif 14 <= hour < 16:
-            return 0.3  # Afternoon (starting to cool)
+            return 0.3   # Winding down
         elif 16 <= hour < 18:
-            return 0.0  # Cooling
+            return 0.0   # Cooling starts
         else:
-            return -0.5  # Evening (temperatures falling)
+            return -0.5  # Night / early morning
+
+    # ------------------------------------------------------------------
+    # Probability estimation
+    # ------------------------------------------------------------------
 
     def _estimate_bracket_probability(
         self,
         bracket: Bracket,
         current_bracket_index: int,
         daily_max_f: float,
-        distance_f: float,
+        time_factor: float,
+        forecast_high_f: Optional[float],
+    ) -> float:
+        """
+        Estimate the probability (0-100) that the FINAL daily high lands
+        in this bracket's range.
+
+        Key rule: the daily high only ever increases. So any bracket whose
+        entire range is BELOW the current daily max is eliminated (0% chance
+        of winning).
+        """
+
+        # ---- Open-ended LOW bracket (lower_f=None): YES wins if high < upper_f ----
+        if bracket.lower_f is None:
+            if daily_max_f >= bracket.upper_f:
+                # The daily max has already exceeded this bracket's ceiling.
+                # The final high cannot land below upper_f. Dead bracket.
+                return 0.0
+            # Still alive — estimate chance the max doesn't rise above upper_f
+            margin_f = bracket.upper_f - daily_max_f
+            return self._low_bracket_probability(margin_f, time_factor)
+
+        # ---- Middle / high brackets ----
+
+        # Any bracket entirely below the current bracket is eliminated.
+        if bracket.index < current_bracket_index:
+            return 0.0  # Dead — final high is already above this range
+
+        # Current bracket: the daily max is inside this range right now.
+        if bracket.index == current_bracket_index:
+            if forecast_high_f is not None:
+                # Let the forecast model estimate how likely the temp stays here.
+                # If forecast > bracket.upper_f, temp is expected to rise out —
+                # probability should reflect that, floored at 5% for forecast error.
+                forecast_prob = self._forecast_based_probability(
+                    bracket, forecast_high_f, daily_max_f, time_factor
+                )
+                return max(5.0, forecast_prob)
+            return self._current_bracket_probability(time_factor)
+
+        # Higher bracket: not yet reached.
+        if forecast_high_f is not None:
+            return self._forecast_based_probability(
+                bracket, forecast_high_f, daily_max_f, time_factor
+            )
+        return self._heuristic_probability(bracket, daily_max_f, time_factor)
+
+    def _low_bracket_probability(self, margin_f: float, time_factor: float) -> float:
+        """
+        Probability that the daily max WON'T rise above the bracket ceiling.
+        Called only when daily_max < bracket.upper_f (bracket still alive).
+        """
+        # During cooling phase the final high is essentially already locked in.
+        if time_factor <= 0:
+            # Large margin means the ceiling is far above current max — very safe.
+            # Small margin means close to the boundary — riskier.
+            if margin_f > 4:
+                return 80.0
+            elif margin_f > 2:
+                return 60.0
+            else:
+                return 40.0
+        else:
+            # Still in the warming phase — temp might keep climbing
+            if margin_f > 6:
+                return 55.0
+            elif margin_f > 4:
+                return 35.0
+            elif margin_f > 2:
+                return 20.0
+            else:
+                return 10.0
+
+    def _current_bracket_probability(self, time_factor: float) -> float:
+        """
+        Probability that the final high stays within the current bracket.
+        """
+        if time_factor <= 0:
+            return 65.0   # Cooling — likely to stay here
+        elif time_factor >= 1.0:
+            return 30.0   # Peak warming — may push to a higher bracket
+        else:
+            return 45.0   # Shoulder period
+
+    def _forecast_based_probability(
+        self,
+        bracket: Bracket,
+        forecast_high_f: float,
+        daily_max_f: float,
         time_factor: float,
     ) -> float:
         """
-        Estimate probability (0-100) that this bracket will be hit.
+        Estimate probability using NWS forecast as the best estimate of the
+        final daily high, blended with the current daily max as the day progresses.
 
-        Heuristic based on:
-        - Distance from current daily max
-        - Time of day (warming vs cooling)
-        - Whether we've already crossed this bracket
+        Models uncertainty with a Gaussian (sigma=3°F).
         """
-        # If we're already in this bracket or passed it
-        if bracket.index == current_bracket_index:
-            return 95.0  # Very high probability
-
-        if bracket.index < current_bracket_index:
-            # Lower bracket - already crossed
-            return 99.0  # Almost certain (won't go back down)
-
-        # Higher bracket - not yet reached
-        if distance_f < 0:
-            # Already above this bracket
-            return 99.0
-
-        # Not yet reached - depends on distance and time
-        if distance_f <= 2.0 and time_factor >= 0.5:
-            # Very close and still warming
-            return 70.0
-        elif distance_f <= 4.0 and time_factor >= 0.3:
-            # Moderate distance, still some warming potential
-            return 40.0
-        elif distance_f > 6.0:
-            # Far away
-            if time_factor <= 0:
-                return 5.0  # Cooling, unlikely
-            else:
-                return 15.0  # Warming but far
+        # Blend forecast vs current max depending on time of day:
+        # Morning (warming) → trust forecast heavily; afternoon → trust current max
+        # The daily max only becomes informative once warming is underway.
+        if time_factor >= 0.8:
+            # Morning/early: forecast is king, daily max is just getting started
+            estimate = forecast_high_f * 0.80 + daily_max_f * 0.20
+        elif time_factor >= 0.3:
+            # Near peak: blend roughly equally
+            estimate = forecast_high_f * 0.50 + daily_max_f * 0.50
+        elif time_factor >= 0:
+            # Late afternoon: current max is nearly final
+            estimate = forecast_high_f * 0.25 + daily_max_f * 0.75
         else:
-            # 4-6 degrees away
-            if time_factor > 0:
-                return 25.0
-            else:
-                return 10.0
+            # Evening/night — current max IS essentially the final answer
+            estimate = daily_max_f
+
+        # Forecast uncertainty: ±3°F standard deviation captures most error
+        sigma = 3.0
+
+        if bracket.upper_f is None:
+            # Open-ended high bracket: P(final high >= lower_f)
+            z = (bracket.lower_f - estimate) / sigma
+            prob = 0.5 * (1.0 - math.erf(z / math.sqrt(2)))
+            return min(92.0, max(0.5, prob * 100))
+        else:
+            # Range bracket: P(lower_f <= final high < upper_f)
+            z_low = (bracket.lower_f - estimate) / sigma
+            z_high = (bracket.upper_f - estimate) / sigma
+            cdf_low = 0.5 * (1.0 + math.erf(z_low / math.sqrt(2)))
+            cdf_high = 0.5 * (1.0 + math.erf(z_high / math.sqrt(2)))
+            prob = cdf_high - cdf_low
+            return min(92.0, max(0.5, prob * 100))
+
+    def _heuristic_probability(
+        self,
+        bracket: Bracket,
+        daily_max_f: float,
+        time_factor: float,
+    ) -> float:
+        """
+        Fallback probability estimate when no NWS forecast is available.
+        Uses distance from daily max to bracket and time of day.
+        Called only for brackets ABOVE the current one (not-yet-reached).
+        """
+        # Distance: how far the daily max needs to rise to reach this bracket
+        if bracket.lower_f is None:
+            distance_f = 0.0  # shouldn't happen for upper brackets, guard anyway
+        else:
+            distance_f = bracket.lower_f - daily_max_f
+
+        if distance_f <= 0:
+            # Already at or past lower bound of this bracket
+            return 70.0
+        elif distance_f <= 2.0 and time_factor >= 0.5:
+            return 50.0
+        elif distance_f <= 4.0 and time_factor >= 0.3:
+            return 28.0
+        elif distance_f > 6.0:
+            return 5.0 if time_factor <= 0 else 10.0
+        else:  # 4-6 degrees away
+            return 8.0 if time_factor <= 0 else 18.0
+
+    # ------------------------------------------------------------------
+    # Signal generation
+    # ------------------------------------------------------------------
 
     def _generate_signal(
         self,
@@ -187,25 +335,54 @@ class TradingStrategy:
         probability: float,
         market_price: MarketPrice,
         portfolio,
-        distance_f: float,
         time_factor: float,
     ) -> TradingSignal:
         """
         Generate a trading signal based on estimated probability vs market price.
 
-        Logic:
-        - If probability is high but YES price is low → BUY YES
-        - If probability is low but NO price is low → BUY NO
-        - Otherwise SKIP
+        Before generating any BUY:
+          1. Enforce minimum price floors (don't fight the market at penny prices)
+          2. Market-divergence check (skip if bot vs market disagree too strongly)
         """
         yes_price = market_price.yes_price_cents
         no_price = market_price.no_price_cents
 
-        # Check if bracket is likely (high probability)
+        # Market-implied YES probability (cents ~ %)
+        market_implied_pct = float(yes_price)
+
+        # ---- BUY YES: bracket is likely to be the final winner ----
         if probability >= 60:
-            # Likely to hit - consider buying YES
+            # Price floor: never buy YES below minimum
+            if yes_price < TRADING.min_yes_entry_cents:
+                return TradingSignal(
+                    action="SKIP",
+                    bracket=bracket,
+                    price_cents=0,
+                    contracts=0,
+                    reason="",
+                    skip_reason=(
+                        f"YES price {yes_price}¢ below minimum "
+                        f"{TRADING.min_yes_entry_cents}¢ — market disagrees strongly"
+                    ),
+                )
+
+            # Market divergence check: if market implies much lower prob, skip
+            divergence = probability - market_implied_pct
+            if divergence > TRADING.max_market_divergence_pct:
+                return TradingSignal(
+                    action="SKIP",
+                    bracket=bracket,
+                    price_cents=0,
+                    contracts=0,
+                    reason="",
+                    skip_reason=(
+                        f"Market divergence too wide: bot={probability:.0f}% "
+                        f"market={market_implied_pct:.0f}% "
+                        f"(gap={divergence:.0f}pp > {TRADING.max_market_divergence_pct:.0f}pp limit)"
+                    ),
+                )
+
             if yes_price < TRADING.yes_entry_current_bracket_max:
-                # Good price for likely bracket
                 contracts = portfolio.calculate_position_size(
                     yes_price_cents=yes_price,
                     max_contracts=TRADING.max_contracts_per_trade,
@@ -217,7 +394,10 @@ class TradingStrategy:
                         bracket=bracket,
                         price_cents=yes_price,
                         contracts=contracts,
-                        reason=f"High probability ({probability:.0f}%) at good price ({yes_price}¢)",
+                        reason=(
+                            f"High probability ({probability:.0f}%) at {yes_price}¢ "
+                            f"(market={market_implied_pct:.0f}%)"
+                        ),
                     )
 
             return TradingSignal(
@@ -226,13 +406,47 @@ class TradingStrategy:
                 price_cents=0,
                 contracts=0,
                 reason="",
-                skip_reason=f"YES price too high ({yes_price}¢ >= {TRADING.yes_entry_current_bracket_max}¢)",
+                skip_reason=(
+                    f"YES price {yes_price}¢ >= entry max "
+                    f"{TRADING.yes_entry_current_bracket_max}¢"
+                ),
             )
 
+        # ---- BUY NO: bracket is unlikely to be the final winner ----
         elif probability <= 20:
-            # Unlikely to hit - consider buying NO
+            # Price floor: never buy NO below minimum
+            if no_price < TRADING.min_no_entry_cents:
+                return TradingSignal(
+                    action="SKIP",
+                    bracket=bracket,
+                    price_cents=0,
+                    contracts=0,
+                    reason="",
+                    skip_reason=(
+                        f"NO price {no_price}¢ below minimum "
+                        f"{TRADING.min_no_entry_cents}¢ — market already prices this out"
+                    ),
+                )
+
+            # Market divergence check: if market implies YES is likely (high YES price),
+            # but we think it's unlikely, check the gap.
+            # For NO: our YES probability is low, market's YES probability = yes_price.
+            divergence = market_implied_pct - probability
+            if divergence > TRADING.max_market_divergence_pct:
+                return TradingSignal(
+                    action="SKIP",
+                    bracket=bracket,
+                    price_cents=0,
+                    contracts=0,
+                    reason="",
+                    skip_reason=(
+                        f"Market divergence too wide for NO: bot={probability:.0f}% "
+                        f"market={market_implied_pct:.0f}% "
+                        f"(gap={divergence:.0f}pp > {TRADING.max_market_divergence_pct:.0f}pp limit)"
+                    ),
+                )
+
             if no_price < TRADING.no_entry_far_bracket_max:
-                # Good price for unlikely bracket
                 contracts = portfolio.calculate_position_size(
                     yes_price_cents=no_price,
                     max_contracts=TRADING.max_contracts_per_trade,
@@ -244,7 +458,10 @@ class TradingStrategy:
                         bracket=bracket,
                         price_cents=no_price,
                         contracts=contracts,
-                        reason=f"Low probability ({probability:.0f}%) at good NO price ({no_price}¢)",
+                        reason=(
+                            f"Low probability ({probability:.0f}%) at NO={no_price}¢ "
+                            f"(market YES={market_implied_pct:.0f}%)"
+                        ),
                     )
 
             return TradingSignal(
@@ -253,18 +470,28 @@ class TradingStrategy:
                 price_cents=0,
                 contracts=0,
                 reason="",
-                skip_reason=f"NO price too high ({no_price}¢ >= {TRADING.no_entry_far_bracket_max}¢)",
+                skip_reason=(
+                    f"NO price {no_price}¢ >= entry max "
+                    f"{TRADING.no_entry_far_bracket_max}¢"
+                ),
             )
 
-        # Moderate probability - no clear edge
+        # ---- Moderate probability: no clear edge ----
         return TradingSignal(
             action="SKIP",
             bracket=bracket,
             price_cents=0,
             contracts=0,
             reason="",
-            skip_reason=f"Moderate probability ({probability:.0f}%), no clear edge",
+            skip_reason=(
+                f"Moderate probability ({probability:.0f}%), no clear edge "
+                f"(market={market_implied_pct:.0f}%)"
+            ),
         )
+
+    # ------------------------------------------------------------------
+    # Exit logic (unchanged in principle)
+    # ------------------------------------------------------------------
 
     def should_exit_position(
         self,
@@ -274,43 +501,31 @@ class TradingStrategy:
         """
         Determine if we should exit a position.
 
-        Args:
-            position_db: Position dict from database
-            current_price: Current market price
-
         Returns:
             (should_exit, reason)
         """
         side = position_db["side"]
         entry_price = position_db["entry_price_cents"]
-        contracts = position_db["contracts"]
 
-        # Get current price for our side
         if side == "YES":
             current_side_price = current_price.yes_price_cents
         else:
             current_side_price = current_price.no_price_cents
 
-        # Calculate gain/loss
         gain_cents = current_side_price - entry_price
         gain_percent = (gain_cents / entry_price) * 100 if entry_price > 0 else 0
 
-        # Take profit conditions
         if gain_cents >= TRADING.take_profit_cents:
-            return True, f"take_profit_cents (+{gain_cents}¢)"
+            return True, f"take_profit_cents (+{gain_cents}c)"
 
-        # Only apply percentage exit when the absolute gain is meaningful —
-        # prevents exiting 4¢ positions on a 1¢ bid/ask spread move
         if (gain_percent >= TRADING.take_profit_percent
                 and gain_cents >= TRADING.take_profit_min_cents):
             return True, f"take_profit_percent (+{gain_percent:.1f}%)"
 
         if current_side_price >= TRADING.lock_profit_price:
-            return True, f"lock_profit_price ({current_side_price}¢ >= {TRADING.lock_profit_price}¢)"
+            return True, f"lock_profit_price ({current_side_price}c >= {TRADING.lock_profit_price}c)"
 
-        # Stop loss conditions
         if gain_percent <= -TRADING.stop_loss_percent:
             return True, f"stop_loss ({gain_percent:.1f}% loss)"
 
-        # No exit condition met
         return False, ""

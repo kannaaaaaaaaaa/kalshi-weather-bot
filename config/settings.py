@@ -40,6 +40,8 @@ class StationConfig:
     kalshi_series: str  # Kalshi series ticker for daily high temp
     timezone: object  # ZoneInfo or fixed UTC offset — for LST day boundary calcs
     description: str
+    lat: float = 0.0   # WGS84 latitude for NWS forecast lookups
+    lon: float = 0.0   # WGS84 longitude (negative = west)
 
     @property
     def lst_tz(self):
@@ -59,6 +61,8 @@ STATIONS: dict[City, StationConfig] = {
         kalshi_series="KXHIGHNY",
         timezone=_tz("US/Eastern", -5),
         description="Central Park, New York",
+        lat=40.7812,
+        lon=-73.9665,
     ),
     City.CHICAGO: StationConfig(
         city=City.CHICAGO,
@@ -66,6 +70,8 @@ STATIONS: dict[City, StationConfig] = {
         kalshi_series="KXHIGHCHI",
         timezone=_tz("US/Central", -6),
         description="Midway Airport, Chicago",
+        lat=41.7868,
+        lon=-87.7522,
     ),
     City.MIAMI: StationConfig(
         city=City.MIAMI,
@@ -73,6 +79,8 @@ STATIONS: dict[City, StationConfig] = {
         kalshi_series="KXHIGHMIA",
         timezone=_tz("US/Eastern", -5),
         description="Miami International Airport",
+        lat=25.7959,
+        lon=-80.2870,
     ),
     City.AUSTIN: StationConfig(
         city=City.AUSTIN,
@@ -80,11 +88,25 @@ STATIONS: dict[City, StationConfig] = {
         kalshi_series="KXHIGHAUS",
         timezone=_tz("US/Central", -6),
         description="Austin-Bergstrom International Airport",
+        lat=30.1945,
+        lon=-97.6699,
     ),
 }
 
 
 # --- API Configuration ---
+
+@dataclass(frozen=True)
+class NWSConfig:
+    """NWS (National Weather Service) forecast API settings."""
+
+    base_url: str = "https://api.weather.gov"
+    timeout_seconds: int = 15
+    # How long to cache a forecast before re-fetching (seconds).
+    # NWS updates forecasts roughly every 1-6 hours, so 30 min is safe.
+    cache_ttl_seconds: int = 1800
+    user_agent: str = "KalshiWeatherBot/0.1 (research; contact@example.com)"
+
 
 @dataclass(frozen=True)
 class AviationWeatherConfig:
@@ -188,6 +210,27 @@ class TradingConfig:
     min_market_volume: int = 100  # Skip if volume < 100
     max_spread_cents: int = 20  # Skip if spread > 20¢
 
+    # --- Improved signal quality filters ---
+
+    # Minimum entry prices — never fight the market at near-zero prices.
+    # If the market says 1-14c, there's a 85-99% chance we're wrong.
+    min_yes_entry_cents: int = 15  # Skip YES entries cheaper than 15¢
+    min_no_entry_cents: int = 10   # Skip NO entries cheaper than 10¢
+
+    # Market divergence threshold — if our probability estimate differs from
+    # the market-implied probability by more than this many percentage points,
+    # the market knows something we don't. Skip the trade.
+    # Tightened from 30 to 20 — the market is usually right.
+    max_market_divergence_pct: float = 20.0
+
+    # Hard stop: no new position entries after this local hour.
+    # After 4 PM the warming phase is over and the daily high is nearly set.
+    no_new_entries_after_hour: int = 16
+
+    # No entries before this local hour — overnight temps are meaningless
+    # for predicting the daily high. Wait until warming is underway.
+    no_new_entries_before_hour: int = 10
+
 
 # --- Database ---
 
@@ -198,6 +241,7 @@ DB_PATH = "data/weather_bot.db"
 
 AVIATION_WEATHER = AviationWeatherConfig()
 KALSHI = KalshiConfig()
+NWS = NWSConfig()
 TRADING = TradingConfig()
 
 ALL_ICAO_IDS = [s.icao for s in STATIONS.values()]

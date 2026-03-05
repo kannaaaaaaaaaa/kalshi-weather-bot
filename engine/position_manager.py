@@ -188,6 +188,18 @@ class PositionManager:
         for position in open_positions:
             ticker = position["ticker"]
 
+            # If the market date has already passed, try to determine settlement.
+            if not self._is_tradeable(ticker):
+                # Try to fetch final price from Kalshi (settled markets show
+                # yes_price=100 for the winner, 0 for losers).
+                settlement_price = await self._get_settlement_price(position)
+                logger.info(
+                    "Market %s has expired, settling at %dc (%s side)",
+                    ticker, settlement_price, position["side"],
+                )
+                exits.append((position["id"], "settlement", settlement_price))
+                continue
+
             # Fetch current price
             price = await self.kalshi.fetch_market_price(ticker)
             if price is None:
@@ -204,6 +216,33 @@ class PositionManager:
                 exits.append((position["id"], reason, exit_price))
 
         return exits
+
+    async def _get_settlement_price(self, position: dict) -> int:
+        """
+        Determine the settlement price for an expired position.
+
+        For binary markets: winner pays 100c/contract, loser pays 0c.
+        We try to fetch from Kalshi; if unavailable, conservatively assume loss.
+        """
+        ticker = position["ticker"]
+        side = position["side"]
+
+        try:
+            price = await self.kalshi.fetch_market_price(ticker)
+            if price is not None:
+                # Settled markets show yes_price=100 (winner) or 0 (loser)
+                if side == "YES":
+                    return price.yes_price_cents
+                else:
+                    return price.no_price_cents
+        except Exception:
+            logger.warning("Could not fetch settlement for %s", ticker)
+
+        # Conservative fallback: assume position lost (0 payout)
+        logger.warning(
+            "No settlement data for %s — assuming loss (0c payout)", ticker
+        )
+        return 0
 
     def _check_position_limits(self, ticker: str) -> bool:
         """
@@ -222,15 +261,18 @@ class PositionManager:
             )
             return False
 
-        # Check total position limit
-        open_positions = self.db.get_open_positions()
-        if len(open_positions) >= TRADING.max_total_positions:
-            logger.debug("Max total positions reached (%d)", len(open_positions))
+        # Only count positions for current/future markets when checking limits.
+        # Past-day positions are stale and will be closed by check_position_exits.
+        all_open = self.db.get_open_positions()
+        active_positions = [p for p in all_open if self._is_tradeable(p["ticker"])]
+
+        if len(active_positions) >= TRADING.max_total_positions:
+            logger.debug("Max total positions reached (%d)", len(active_positions))
             return False
 
         # Check per-city limit
         city = ticker.split("-")[0] if "-" in ticker else "unknown"
-        city_positions = [p for p in open_positions if p["city"] == city]
+        city_positions = [p for p in active_positions if p["city"] == city]
         if len(city_positions) >= TRADING.max_positions_per_city:
             logger.debug("Max positions for %s reached (%d)", city, len(city_positions))
             return False

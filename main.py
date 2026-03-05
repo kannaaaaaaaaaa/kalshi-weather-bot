@@ -29,6 +29,7 @@ from config.settings import (
     City,
 )
 from data.metar_client import MetarClient, TemperatureReading
+from data.nws_client import NWSForecastClient
 from engine.bracket_tracker import (
     BracketTracker,
     BracketCrossing,
@@ -56,6 +57,7 @@ class WeatherBot:
 
     def __init__(self, db_path: str = "data/weather_bot.db"):
         self.metar = MetarClient()
+        self.nws = NWSForecastClient()
         self.kalshi = KalshiClient()
         self.tracker = BracketTracker()
         self.db = Database(db_path)
@@ -76,6 +78,8 @@ class WeatherBot:
         self._trading_cycle_count = 0
         self._total_crossings = 0
         self._total_trades = 0
+        # Latest NWS forecasts, keyed by City enum
+        self._forecasts: dict[City, float] = {}  # City -> forecast_high_f
 
     async def start(self, once: bool = False) -> None:
         """Start the bot. If once=True, run a single cycle and exit."""
@@ -173,24 +177,39 @@ class WeatherBot:
         self._trading_cycle_count += 1
         logger.debug("--- Trading Cycle %d ---", self._trading_cycle_count)
 
-        # 1. Get current temperature state
+        # 0. Reload brackets if the calendar day has rolled over
+        await self._reload_brackets_if_stale()
+
+        # 1. Refresh NWS forecasts every ~30 min (client handles its own cache TTL)
+        await self._refresh_forecasts()
+
+        # 2. Get current temperature state
         state = self.tracker.get_status()
 
-        # 2. For each city, evaluate all brackets
+        # 3. For each city, evaluate all brackets
         for city, config in STATIONS.items():
             if not TRADING.enable_two_sided_trading:
                 continue
 
             await self._evaluate_city_opportunities(city, config, state)
 
-        # 3. Check existing positions for exits
+        # 4. Check existing positions for exits
         if TRADING.enable_active_exits:
             await self._manage_open_positions()
 
-        # 4. Snapshot portfolio periodically
+        # 5. Snapshot portfolio periodically
         if self._trading_cycle_count % 10 == 0:
             self.db.record_portfolio_snapshot(self.portfolio)
             self._print_trading_status()
+
+    async def _refresh_forecasts(self) -> None:
+        """Fetch NWS high-temperature forecasts (cached inside NWSForecastClient)."""
+        try:
+            forecasts = await self.nws.fetch_all()
+            for city, data in forecasts.items():
+                self._forecasts[city] = data.forecast_high_f
+        except Exception:
+            logger.exception("Failed to refresh NWS forecasts")
 
     async def _evaluate_city_opportunities(
         self,
@@ -231,6 +250,14 @@ class WeatherBot:
         if not current_bracket:
             return
 
+        # NWS forecast for this city (None = fall back to heuristic model)
+        forecast_high_f = self._forecasts.get(city)
+        if forecast_high_f:
+            logger.debug(
+                "%s: Using NWS forecast %.1f°F (daily max so far %.1f°F)",
+                city.value, forecast_high_f, daily_max_f,
+            )
+
         # Evaluate each bracket
         for bracket in tracker.bracket_set.brackets:
             # Get price for this bracket
@@ -250,6 +277,7 @@ class WeatherBot:
                 local_time=local_time,
                 market_price=price,
                 portfolio=self.portfolio,
+                forecast_high_f=forecast_high_f,
             )
 
             # Log evaluation
@@ -285,6 +313,32 @@ class WeatherBot:
 
     # NOTE: Old _handle_crossing method removed - now using continuous evaluation
     # in _trading_loop instead of reactive bracket crossing approach
+
+    async def _reload_brackets_if_stale(self) -> None:
+        """Reload brackets for any city whose event_date is in the past."""
+        today = date.today()
+        for city, config in STATIONS.items():
+            tracker = self.tracker._trackers.get(config.icao)
+            if tracker is None or tracker.bracket_set is None:
+                continue
+            if tracker.bracket_set.event_date < today:
+                logger.info(
+                    "%s: Brackets are stale (%s), reloading for %s",
+                    city.value,
+                    tracker.bracket_set.event_date,
+                    today,
+                )
+                try:
+                    bracket_set = await self.kalshi.fetch_brackets(city)
+                    if bracket_set:
+                        self.tracker.load_brackets(config.icao, bracket_set)
+                        self.tracker.reset_day(config.icao, today)
+                    else:
+                        logger.warning(
+                            "%s: No brackets available for %s", city.value, today
+                        )
+                except Exception:
+                    logger.exception("Failed to reload brackets for %s", city.value)
 
     async def _load_brackets_for_all(self) -> None:
         """Load today's bracket definitions from Kalshi for all cities."""
@@ -397,6 +451,7 @@ class WeatherBot:
     async def _shutdown(self) -> None:
         """Clean up resources."""
         await self.metar.close()
+        await self.nws.close()
         await self.kalshi.close()
         self.db.close()
         logger.info("Shutdown complete")
